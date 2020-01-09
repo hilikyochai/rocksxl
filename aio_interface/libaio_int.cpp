@@ -66,7 +66,11 @@ static void *aioThread()
 }
   
 static int fd;
+#ifdef LOCAL
 const char *driveName = "/home/hilik/test_disk/tmpfile";
+#else
+const char *driveName = "/home/hiliky/test_disk/tmpfile";
+#endif
 void aioInit()
 {
   if(io_setup(MAX_OPEN_REQUEST_NUM, &ctx)!=0){ //init

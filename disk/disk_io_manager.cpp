@@ -4,12 +4,35 @@ namespace rocksxl
 {
 namespace disk
 {
+
+  DiskSyncRead::DiskSyncRead(const DiskPartitionId partition,
+			     const size_t blockNum) :
+    m_data(new DiskBlock)
+  {
+    std::unique_lock<std::mutex> lk(m_mutex);
+    const size_t lba = partition * s_partitionSizeBytes + blockNum *s_diskBlockSize ;
+    auto aioData = new aio_interface::AioData(lba, m_data.get(), s_diskBlockSize,
+					      this, fetchDone);   
+    aio_interface::Read(aioData);
+    m_cond.wait(lk);
+  }
+
+  void DiskSyncRead::fetchDone(aio_interface::AioData *data)
+  {
+    assert(data->status == 0);
+    auto me = (DiskSyncRead *) data->userCntxt;
+    std::lock_guard<std::mutex> lk(me->m_mutex);;
+    delete data;
+    me->m_cond.notify_one();
+  }
+  
   
   DiskFetcher::DiskFetcher(const Locations &locations) :
     m_locations(locations),
     m_maxActiveRequests(1) ,
     m_activeRequests(0),
-    m_nextFetchLocation(m_locations.cbegin(), 0)
+    m_nextFetchLocation(m_locations.cbegin(), 0),
+    m_terminated(false)
   {
     std::unique_lock<std::mutex> lk(m_mutex);
     fetch();    
@@ -34,20 +57,23 @@ namespace disk
     return ret;
   }
   
+  
   void DiskFetcher::fetch()
   {
+    if (m_terminated)
+      return;
     while (m_activeRequests + m_fetchedData.size() <  m_maxActiveRequests) {
       if (m_nextFetchLocation.first == m_locations.cend()) {
 	break;
       }
       m_activeRequests++;
-      const size_t lba = (*m_nextFetchLocation.first) *s_diskChunkSize + m_nextFetchLocation.second;
+      const size_t lba = (*m_nextFetchLocation.first) *s_partitionSizeBytes + m_nextFetchLocation.second;
       auto aioData = new aio_interface::AioData(lba, new DiskBlock, s_diskBlockSize,
 						  this, fetchDone);
       
       aio_interface::Read(aioData);
       m_nextFetchLocation.second += s_diskBlockSize;
-      if (m_nextFetchLocation.second >= s_diskChunkSize) {
+      if (m_nextFetchLocation.second >= s_partitionSizeBytes) {
 	m_nextFetchLocation.first++;
 	m_nextFetchLocation.second=0;
       }
@@ -58,14 +84,36 @@ namespace disk
   {
     assert(data->status == 0);
     auto me = (DiskFetcher *) data->userCntxt;
-    std::lock_guard<std::mutex> lk(me->m_mutex);;
-    bool signal = me->m_fetchedData.empty();
-    me->m_fetchedData.push_back(DiskBlockPtr((DiskBlock *)data->data));
-    me->m_activeRequests--;
-    if (signal) {
-      me->m_cond.notify_one();
+    bool toDelete = false;
+    {
+      std::lock_guard<std::mutex> lk(me->m_mutex);;
+      me->m_activeRequests--;
+      if (me->m_terminated && me->m_activeRequests == 0) {
+	toDelete = true;
+      }  else {    
+	me->m_fetchedData.push_back(DiskBlockPtr((DiskBlock *)data->data));
+	me->m_cond.notify_one();
+      }
+      delete data;
+    }
+    if (toDelete) {
+      delete me;
     }
   }
+
+  void DiskFetcher::terminate()
+  {
+    bool toDelete = false;
+    {
+      std::unique_lock<std::mutex> lk(m_mutex);
+      m_terminated = true;
+      toDelete = m_activeRequests == 0;
+    }
+    if (toDelete) {
+      delete this;
+    }
+  }
+    
 
 
   DiskWriter::DiskWriter(FileData &dataToWrite,
@@ -88,12 +136,12 @@ namespace disk
       m_locations.push_back(DiskSpaceManager::s_diskSpaceManager
 			    ->getFreePlace());
     } 
-    aioData.aioLba = m_locations.back() * s_diskChunkSize + m_lastLocationOffset;
+    aioData.aioLba = m_locations.back() * s_partitionSizeBytes + m_lastLocationOffset;
     aioData.data = const_cast<char *>( m_dataToWrite[m_dataLocation]->data);
     aioData.size = s_diskBlockSize;
     m_dataLocation++;
     m_lastLocationOffset += s_diskBlockSize;
-    if (m_lastLocationOffset >= s_diskChunkSize) {
+    if (m_lastLocationOffset >= s_partitionSizeBytes) {
       m_lastLocationOffset  = 0;
       lastDataForLoaction = true;
     } else {
@@ -151,6 +199,7 @@ namespace disk
     if (!s_diskWriteManager->m_writers.empty()) {
       s_diskWriteManager->scheduleWrites();
     }
+    delete aioData;
   }
 
 }
@@ -226,7 +275,7 @@ void runWriter(uint indexNum)
   }
   nWriters++;
   int fileSize = rand() % 16 + 1;
-  uint numBlocks = fileSize * (disk::s_diskChunkSize/disk::s_diskBlockSize);
+  uint numBlocks = fileSize * (disk::s_partitionSizeBytes/disk::s_diskBlockSize);
   disk::FileData dataToWrite(numBlocks);
   for (uint i = 0; i < numBlocks; i++) {    
     dataToWrite[i] = disk::DiskBlockPtr(new disk::DiskBlock); 
@@ -249,14 +298,14 @@ void runCompact(std::vector<size_t> filesToCompact,
   }
   
   std::vector< disk::DiskBlockPtr >compactOutput;
-  size_t count = fetchers.size()*16* (disk::s_diskChunkSize/disk::s_diskBlockSize);
+  size_t count = fetchers.size()*16* disk::s_nBlocksInPartition;
   for (size_t j=0; j<count; j++)   {
     // randomly select a block from the fetched
     int i = rand() % fetchers.size();
     if (fetchers[i]) {
       auto block = fetchers[i]->getBlock();
       if (!block) {
-	delete fetchers[i];
+	fetchers[i]->terminate();
 	fetchers[i] = 0;
       } else {
 	// to get back about the same size we use rand() % fetchers.size...
@@ -274,7 +323,7 @@ void runCompact(std::vector<size_t> filesToCompact,
   auto diskWriter = new disk::DiskWriter(compactOutput, new UtestCompactWriteDone(targetFile, filesToCompact));
   for (auto f : fetchers) {
     if (f)
-      delete f;
+      f->terminate();
   }
   
   
@@ -323,8 +372,7 @@ void threadRun()
   for (int i = 0; i < 100; i++) {
     if ((rand() % 16)) {
       runWriter(selectTarget());
-    } else  {
-      
+    } else  {      
       // compaction job  define 16 fetchers and one target
       std::vector<size_t> fetchers(16);
       for (int k = 0; k < 16; k++) {

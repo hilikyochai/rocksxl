@@ -11,19 +11,22 @@ namespace rocksxl
 namespace disk
 {
   // management of allocation of chunks
-  static const size_t s_diskChunkSize = 1024 * 1024 * 8; // perform 8 M i/o to the disk!
+  static const size_t s_partitionSizeBytes = 1024 * 1024 * 8; // 8M partition Size
 #pragma pack(push,1)
-  struct DiskLocation {
+  typedef uint32_t DiskPartitionId;
+
+  struct DiskPartition {
     enum  LocationStat : uint8_t {freeSpace, inWrite, allocated} ;
-    DiskLocation(uint32_t id_=-1u) : status(freeSpace), id(id_)
+    DiskPartition(DiskPartitionId id_=-1u) : status(freeSpace), id(id_)
     {}
     
     LocationStat status;    
     uint32_t id;
   };
 #pragma pack(pop)
+
   
-  class Locations : public std::list<size_t>
+  class Locations : public std::list<DiskPartitionId>
   {
   public:
     Locations() {}
@@ -38,20 +41,20 @@ namespace disk
       return *this;
     }
 
-    size_t popLocation() {
+    DiskPartitionId popLocation() {
       assert(!empty());
       std::lock_guard<std::mutex> lk(m_mutex);
-      size_t ret = front();
+      DiskPartitionId ret = front();
       pop_front();
       return ret;
     }
     
     
-    void  pushLocation(size_t location) {
+    void  pushLocation(DiskPartitionId location) {
       std::lock_guard<std::mutex> lk(m_mutex);      
       push_front(location);
     }
-    size_t sizeInBytes() const {return size() * s_diskChunkSize;}
+    size_t sizeInBytes() const {return size() * s_partitionSizeBytes;}
   private:
     std::mutex m_mutex;
   };
@@ -69,27 +72,27 @@ namespace disk
     void enlarge(size_t newDiskSize);
     void save(std::string &to);
 
-    size_t getFreePlace() {
+    DiskPartitionId getFreePlace() {
       auto ret = m_freeList.popLocation();
-      m_allLocations[ret].status = DiskLocation::inWrite;
+      m_allLocations[ret].status = DiskPartition::inWrite;
       return ret;
     } 
-    void doneWithWrite(size_t locationId) {
+    void doneWithWrite(DiskPartitionId locationId) {
       auto &diskLocation = m_allLocations[locationId];
-      assert(diskLocation.status == DiskLocation::inWrite);
-      diskLocation.status = DiskLocation::allocated;
+      assert(diskLocation.status == DiskPartition::inWrite);
+      diskLocation.status = DiskPartition::allocated;
     }
     
-    void writeAborted(size_t locationId) {
+    void writeAborted(DiskPartitionId locationId) {
       auto &diskLocation = m_allLocations[locationId];
-      assert(diskLocation.status == DiskLocation::inWrite);
-      diskLocation.status = DiskLocation::freeSpace;
+      assert(diskLocation.status == DiskPartition::inWrite);
+      diskLocation.status = DiskPartition::freeSpace;
       m_freeList.pushLocation(locationId);
     }
-    void freeLocation(size_t locationId) {
+    void freeLocation(DiskPartitionId locationId) {
       auto &diskLocation = m_allLocations[locationId];
-      assert(diskLocation.status == DiskLocation::allocated);      
-      diskLocation.status = DiskLocation::freeSpace;
+      assert(diskLocation.status == DiskPartition::allocated);      
+      diskLocation.status = DiskPartition::freeSpace;
       m_freeList.pushLocation(locationId);
     }
     size_t freeSpaceSize() const {return m_freeList.sizeInBytes();}
@@ -100,7 +103,7 @@ namespace disk
   private:
     size_t                    m_curSize;
     Locations                 m_freeList;
-    std::vector<DiskLocation> m_allLocations; 
+    std::vector<DiskPartition> m_allLocations; 
   };
 }
 }

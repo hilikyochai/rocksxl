@@ -15,21 +15,43 @@ namespace rocksxl
 namespace disk
 {
 #pragma pack(push,1)
-  static const size_t s_diskBlockSize = 0x2000; // must be multiplaction of 4K 
+  static const size_t s_diskBlockSize = 0x2000; // must be multiplaction of 4K
+  static const size_t s_nBlocksInPartition = s_partitionSizeBytes/s_diskBlockSize;
   struct DiskBlock
   {
     char data[s_diskBlockSize];
   };
+  
   typedef std::shared_ptr<DiskBlock> DiskBlockPtr;
-  // management of allocation of chunks
+  typedef std::vector< DiskBlockPtr > FileData;
+
+  // return when the read is done!!!
+  class DiskSyncRead {
+  public:
+    DiskSyncRead(const DiskPartitionId partition,
+		 const size_t blockNum);
+    ~DiskSyncRead() {}
+    DiskBlockPtr getData() {return m_data;}
+  private:
+    static void fetchDone(aio_interface::AioData *);
+    DiskBlockPtr m_data;
+    
+    // to implement wait for response ... 
+    std::mutex                                      m_mutex;
+    std::condition_variable                         m_cond;
+  };
+
+  
   class DiskFetcher
   {
   public:
     DiskFetcher(const Locations &locations);
-    ~DiskFetcher() {};
     DiskBlockPtr getBlock();
+    void      terminate();
     
   private:
+    ~DiskFetcher() {}; // must call to doneWithFetcher!!!    
+  private:    
     const Locations                                 &m_locations;
     std::list< DiskBlockPtr >                       m_fetchedData;
     size_t                                          m_activeRequests;
@@ -37,6 +59,7 @@ namespace disk
     std::pair <Locations::const_iterator, size_t>   m_nextFetchLocation;
     std::mutex                                      m_mutex;
     std::condition_variable                         m_cond;
+    bool m_terminated;
     void fetch();
     // callback from aioInterface..
     static void fetchDone(aio_interface::AioData *);
@@ -49,7 +72,7 @@ namespace disk
     virtual void writeDone(DiskWriter *) = 0;
   };
 
-  typedef std::vector< DiskBlockPtr > FileData;
+
   class DiskWriter
   {
   public:
