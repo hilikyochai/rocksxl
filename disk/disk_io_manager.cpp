@@ -399,7 +399,15 @@ int main()
   for (int i = 0; i < 1024; i++) {
     test_files[i].mutex = new std::mutex;
   }
-  threadRun();
+  std::vector<std::thread *> threads(4);
+  for (auto &thread : threads) {
+    thread = new std::thread(threadRun);
+  }
+  for (auto &thread : threads) {
+    thread->join();
+    delete thread;
+  }
+  
   auto diskWriteManager = disk::DiskWriteManager::s_diskWriteManager;
   while (nWriters > 0 && diskWriteManager->hasWriters()) {
     printf("waiting for writes to finish\n");
